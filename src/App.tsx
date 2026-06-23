@@ -63,28 +63,106 @@ export default function App() {
         
         setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${chunks.length}... (قەبارێ وەجبەیێ: ${chunk.length} دێر)`);
 
-        const response = await fetch('/api/translate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            texts: textsToTranslate,
-            targetLanguage: language,
-            apiKey: apiKey
-          })
-        });
+        let translatedTexts: string[] = [];
 
-        let data;
-        try {
-          data = await response.json();
-        } catch (e) {
-          throw new Error(`سێرڤەر بەرسڤەکا نەدروست زڤڕاند (${response.status})`);
+        if (apiKey && apiKey.trim() !== "") {
+          // Direct client-side call to Gemini API (highly robust, 100% compatible with static hosts like Netlify/GitHub)
+          try {
+            const prompt = `Translate the following array of subtitle texts into ${language}.
+If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
+You MUST maintain the exact same number of items in the array (exactly ${textsToTranslate.length} items).
+Do not translate the formatting, only the meaning. Keep any HTML-like tags (e.g., <i>, <b>) intact.
+Only return the JSON array of translated strings.
+
+Texts:
+${JSON.stringify(textsToTranslate)}`;
+
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [{ text: prompt }]
+                }],
+                generationConfig: {
+                  responseMimeType: 'application/json',
+                  responseSchema: {
+                    type: 'ARRAY',
+                    items: {
+                      type: 'STRING'
+                    }
+                  }
+                }
+              })
+            });
+
+            if (!response.ok) {
+              const errData = await response.json();
+              const apiErrorMsg = errData?.error?.message || response.statusText;
+              
+              if (response.status === 429) {
+                throw new Error("قۆتا تەمام بوویە یان لودا سەر سێرڤەری زۆرە (Rate limit/Quota exceeded). هیڤیە چەند چرکەیەکا ڕاوەستە پاشان تاقی بکەوە.");
+              }
+              throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${apiErrorMsg}`);
+            }
+
+            const data = await response.json();
+            const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+            
+            let parsed: any = [];
+            try {
+              parsed = JSON.parse(rawText.trim());
+            } catch (jsonErr) {
+              const match = rawText.match(/\[[\s\S]*\]/);
+              if (match) {
+                parsed = JSON.parse(match[0]);
+              } else {
+                throw new Error("سیستەمێ وەرگێڕانێ بەرسڤەکا کەتوار نەزڤڕاند");
+              }
+            }
+            
+            if (Array.isArray(parsed)) {
+              translatedTexts = parsed;
+            } else {
+              throw new Error("ئەنجامێ وەرگێڕانێ لیستەکا دروست نەبوو");
+            }
+          } catch (directErr: any) {
+            console.error("Direct client-side call failed", directErr);
+            throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
+          }
+        } else {
+          // Fallback to Express backend if no API Key is provided
+          try {
+            const response = await fetch('/api/translate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                texts: textsToTranslate,
+                targetLanguage: language,
+                apiKey: apiKey
+              })
+            });
+
+            if (response.status === 404) {
+              throw new Error("مێوانداریا تە (مینا Netlify یان GitHub) پشتەڤانیا سێرڤەری ناکەت. پێدڤیە کلیلا خۆ یا Gemini API ل سەر لایێ چەپێ بنڤیسی داکو ڕاستەوخۆ کاربکەت!");
+            }
+
+            let data;
+            try {
+              data = await response.json();
+            } catch (e) {
+              throw new Error(`سێرڤەر بەرسڤەکا نەدروست زڤڕاند (${response.status})`);
+            }
+
+            if (!response.ok) {
+              throw new Error(data.error || 'هەلەیەک د وەرگێڕانێ دا چێبوو (Translation failed)');
+            }
+
+            translatedTexts = data.translatedTexts;
+          } catch (fallbackErr: any) {
+            throw new Error(fallbackErr.message || 'هەلەیەک د وەرگێڕانێ دا چێبوو');
+          }
         }
-
-        if (!response.ok) {
-          throw new Error(data.error || 'هەلەیەک د وەرگێڕانێ دا چێبوو (Translation failed)');
-        }
-
-        const translatedTexts = data.translatedTexts;
 
         // Apply translations back
         chunk.forEach((block, index) => {
