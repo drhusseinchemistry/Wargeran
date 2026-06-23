@@ -1,0 +1,6 @@
+{
+  "name": "Subtitle Translator",
+  "description": "Upload .srt files, translate them to Kurdish (Bahdini/Sorani) and other languages, edit text, and download the modified subtitle file.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
