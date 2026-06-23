@@ -68,12 +68,17 @@ export default function App() {
           })
         });
 
-        if (!response.ok) {
-          const errData = await response.json();
-          throw new Error(errData.error || 'هەلەیەک د وەرگێڕانێ دا چێبوو (Translation failed)');
+        let data;
+        try {
+          data = await response.json();
+        } catch (e) {
+          throw new Error(`سێرڤەر بەرسڤەکا نەدروست زڤڕاند (${response.status})`);
         }
 
-        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'هەلەیەک د وەرگێڕانێ دا چێبوو (Translation failed)');
+        }
+
         const translatedTexts = data.translatedTexts;
 
         // Apply translations back
