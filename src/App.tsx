@@ -9,7 +9,13 @@ export default function App() {
   const [blocks, setBlocks] = useState<SRTBlock[]>([]);
   const [language, setLanguage] = useState<TranslationLanguage>('کوردی - بادینی (Kurdish Badini - Arabic Script)');
   
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('geminiApiKey') || '');
+  const [apiKey, setApiKey] = useState(() => {
+    const saved = localStorage.getItem('geminiApiKey');
+    if (saved && saved.trim() !== '') {
+      return saved;
+    }
+    return 'AIzaSyAon_g8qGdICSReM3v01-HaLTF7CYDwW7k';
+  });
   const [isKeySaved, setIsKeySaved] = useState(false);
 
   const [isTranslating, setIsTranslating] = useState(false);
@@ -64,9 +70,51 @@ export default function App() {
         setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${chunks.length}... (قەبارێ وەجبەیێ: ${chunk.length} دێر)`);
 
         let translatedTexts: string[] = [];
+        let callSucceeded = false;
 
-        if (apiKey && apiKey.trim() !== "") {
-          // Direct client-side call to Gemini API (highly robust, 100% compatible with static hosts like Netlify/GitHub)
+        // 1. First, always try Express backend (even if apiKey is provided, because server-side can bypass CORS, referrer restrictions, and fallback to platform key!)
+        try {
+          const response = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              texts: textsToTranslate,
+              targetLanguage: language,
+              apiKey: apiKey
+            })
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            if (data.translatedTexts && Array.isArray(data.translatedTexts)) {
+              translatedTexts = data.translatedTexts;
+              callSucceeded = true;
+            }
+          } else if (response.status === 404) {
+            console.warn("Backend server not found (likely running on static host like Netlify).");
+          } else {
+            let serverErrorMsg = "Server error";
+            try {
+              const errData = await response.json();
+              serverErrorMsg = errData?.error || response.statusText;
+            } catch (_) {}
+            console.warn("Backend translation failed:", serverErrorMsg);
+            
+            // If we don't have an API key, we cannot try direct client-side, so we must throw the error
+            if (!apiKey || apiKey.trim() === "") {
+              throw new Error(serverErrorMsg);
+            }
+          }
+        } catch (serverErr: any) {
+          console.warn("Server-side call failed:", serverErr);
+          // If we don't have an API key, we cannot try direct client-side, so we must throw the error
+          if (!apiKey || apiKey.trim() === "") {
+            throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
+          }
+        }
+
+        // 2. If server-side failed (or 404ed) AND we have an API key, try direct client-side call
+        if (!callSucceeded && apiKey && apiKey.trim() !== "") {
           try {
             const prompt = `Translate the following array of subtitle texts into ${language}.
 If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
@@ -77,91 +125,83 @@ Only return the JSON array of translated strings.
 Texts:
 ${JSON.stringify(textsToTranslate)}`;
 
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: [{
-                  parts: [{ text: prompt }]
-                }],
-                generationConfig: {
-                  responseMimeType: 'application/json',
-                  responseSchema: {
-                    type: 'ARRAY',
-                    items: {
-                      type: 'STRING'
+            let fetchSuccess = false;
+            let lastApiErrorMsg = "";
+            const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+
+            for (const modelName of modelsToTry) {
+              try {
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{
+                      parts: [{ text: prompt }]
+                    }],
+                    generationConfig: {
+                      responseMimeType: 'application/json',
+                      responseSchema: {
+                        type: 'ARRAY',
+                        items: {
+                          type: 'STRING'
+                        }
+                      }
                     }
+                  })
+                });
+
+                if (!response.ok) {
+                  let apiErrorMsg = response.statusText;
+                  try {
+                    const errData = await response.json();
+                    apiErrorMsg = errData?.error?.message || response.statusText;
+                  } catch (_) {}
+                  
+                  lastApiErrorMsg = apiErrorMsg;
+                  console.warn(`Model ${modelName} call failed: ${apiErrorMsg}. Trying next model...`);
+                  continue;
+                }
+
+                const data = await response.json();
+                const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+                
+                let parsed: any = [];
+                try {
+                  parsed = JSON.parse(rawText.trim());
+                } catch (jsonErr) {
+                  const match = rawText.match(/\[[\s\S]*\]/);
+                  if (match) {
+                    parsed = JSON.parse(match[0]);
+                  } else {
+                    console.warn(`Could not parse JSON response for model ${modelName}. Trying next...`);
+                    continue;
                   }
                 }
-              })
-            });
-
-            if (!response.ok) {
-              const errData = await response.json();
-              const apiErrorMsg = errData?.error?.message || response.statusText;
-              
-              if (response.status === 429) {
-                throw new Error("قۆتا تەمام بوویە یان لودا سەر سێرڤەری زۆرە (Rate limit/Quota exceeded). هیڤیە چەند چرکەیەکا ڕاوەستە پاشان تاقی بکەوە.");
-              }
-              throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${apiErrorMsg}`);
-            }
-
-            const data = await response.json();
-            const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-            
-            let parsed: any = [];
-            try {
-              parsed = JSON.parse(rawText.trim());
-            } catch (jsonErr) {
-              const match = rawText.match(/\[[\s\S]*\]/);
-              if (match) {
-                parsed = JSON.parse(match[0]);
-              } else {
-                throw new Error("سیستەمێ وەرگێڕانێ بەرسڤەکا کەتوار نەزڤڕاند");
+                
+                if (Array.isArray(parsed)) {
+                  translatedTexts = parsed;
+                  fetchSuccess = true;
+                  callSucceeded = true;
+                  break; // Found working model!
+                }
+              } catch (modelErr: any) {
+                console.warn(`Error using model ${modelName}:`, modelErr);
+                lastApiErrorMsg = modelErr.message || "Unknown error";
+                continue;
               }
             }
-            
-            if (Array.isArray(parsed)) {
-              translatedTexts = parsed;
-            } else {
-              throw new Error("ئەنجامێ وەرگێڕانێ لیستەکا دروست نەبوو");
+
+            if (!fetchSuccess) {
+              throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${lastApiErrorMsg}`);
             }
           } catch (directErr: any) {
             console.error("Direct client-side call failed", directErr);
             throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
           }
-        } else {
-          // Fallback to Express backend if no API Key is provided
-          try {
-            const response = await fetch('/api/translate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                texts: textsToTranslate,
-                targetLanguage: language,
-                apiKey: apiKey
-              })
-            });
+        }
 
-            if (response.status === 404) {
-              throw new Error("مێوانداریا تە (مینا Netlify یان GitHub) پشتەڤانیا سێرڤەری ناکەت. پێدڤیە کلیلا خۆ یا Gemini API ل سەر لایێ چەپێ بنڤیسی داکو ڕاستەوخۆ کاربکەت!");
-            }
-
-            let data;
-            try {
-              data = await response.json();
-            } catch (e) {
-              throw new Error(`سێرڤەر بەرسڤەکا نەدروست زڤڕاند (${response.status})`);
-            }
-
-            if (!response.ok) {
-              throw new Error(data.error || 'هەلەیەک د وەرگێڕانێ دا چێبوو (Translation failed)');
-            }
-
-            translatedTexts = data.translatedTexts;
-          } catch (fallbackErr: any) {
-            throw new Error(fallbackErr.message || 'هەلەیەک د وەرگێڕانێ دا چێبوو');
-          }
+        if (!callSucceeded) {
+          throw new Error("کردارا وەرگێڕانێ شکەست خوارن. هیڤیە دڵنیابە کو پەیوەندیا ئینتەرنێتێ و کلیلێن API تە د دروستن.");
         }
 
         // Apply translations back
