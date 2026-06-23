@@ -40,19 +40,41 @@ Only return the JSON array of translated strings.
 Texts:
 ${JSON.stringify(texts)}`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.STRING
+      let response;
+      let retries = 3;
+      let delay = 1000;
+
+      while (retries > 0) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.STRING
+                }
+              }
             }
+          });
+          break; // success
+        } catch (apiError: any) {
+          retries--;
+          console.error(`Gemini API call failed. Retries remaining: ${retries}`, apiError);
+          if (retries === 0) {
+            throw apiError;
           }
+          // wait before retrying (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2;
         }
-      });
+      }
+
+      if (!response) {
+        throw new Error('سیستەمێ وەرگێرانێ چ بەرسڤ نەدا');
+      }
 
       let translatedTexts = [];
       try {

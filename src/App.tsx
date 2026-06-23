@@ -13,6 +13,7 @@ export default function App() {
   const [isKeySaved, setIsKeySaved] = useState(false);
 
   const [isTranslating, setIsTranslating] = useState(false);
+  const [translatingStatus, setTranslatingStatus] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -30,6 +31,7 @@ export default function App() {
         setBlocks(parseSRT(content));
         setError(null);
         setProgress(0);
+        setTranslatingStatus(null);
       }
     };
     reader.readAsText(uploadedFile);
@@ -46,18 +48,21 @@ export default function App() {
     setIsTranslating(true);
     setProgress(0);
     setError(null);
+    setTranslatingStatus('دەستپێکرنا کردارا وەرگێڕانێ...');
 
     try {
-      // Chunk size to balance context limit and speed
-      const CHUNK_SIZE = 20;
-      const chunks = chunkArray(blocks, CHUNK_SIZE);
+      // Larger chunk size (e.g. 80 lines per chunk) to reduce total requests significantly
+      const CHUNK_SIZE = 80;
+      const chunks = chunkArray<SRTBlock>(blocks, CHUNK_SIZE);
       const newBlocks = [...blocks];
       let translatedCount = 0;
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
-        const textsToTranslate = chunk.map(b => b.text);
+        const textsToTranslate = chunk.map((b: SRTBlock) => b.text);
         
+        setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${chunks.length}... (قەبارێ وەجبەیێ: ${chunk.length} دێر)`);
+
         const response = await fetch('/api/translate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -93,9 +98,20 @@ export default function App() {
         translatedCount += chunk.length;
         setProgress(Math.round((translatedCount / blocks.length) * 100));
         setBlocks([...newBlocks]); // Update UI progressively
+
+        // If there are more chunks, wait for 4 seconds to respect the Gemini API rate limit (RPM 15)
+        if (i < chunks.length - 1) {
+          for (let s = 4; s > 0; s--) {
+            setTranslatingStatus(`خێرایی ل بەرچاو هاتیە وەرگرتن: ڕاوەستان بۆ ${s} چرکەیان داکو کێشە دروست نەبیت...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
       }
+      setTranslatingStatus('پرۆسە ب سەرکەفتیانە تەمام بوو! ✓');
+      setTimeout(() => setTranslatingStatus(null), 3000);
     } catch (err: any) {
       setError(err.message || 'هەلەیەک د وەرگێڕانێ دا چێبوو');
+      setTranslatingStatus(null);
     } finally {
       setIsTranslating(false);
     }
@@ -297,6 +313,11 @@ export default function App() {
                         transition={{ duration: 0.3 }}
                       />
                     </div>
+                    {translatingStatus && (
+                      <p className="text-[11px] text-indigo-600 mt-2 font-medium leading-relaxed">
+                        {translatingStatus}
+                      </p>
+                    )}
                   </div>
                 )}
 
