@@ -23,7 +23,12 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const [chunkStatuses, setChunkStatuses] = useState<{ [key: number]: 'idle' | 'translating' | 'completed' | 'failed' }>({});
+  const [chunkErrors, setChunkErrors] = useState<{ [key: number]: string }>({});
+
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const CHUNK_SIZE = 80;
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const uploadedFile = e.target.files?.[0];
@@ -34,10 +39,26 @@ export default function App() {
     reader.onload = (event) => {
       const content = event.target?.result as string;
       if (content) {
-        setBlocks(parseSRT(content));
+        const parsed = parseSRT(content);
+        setBlocks(parsed);
         setError(null);
         setProgress(0);
         setTranslatingStatus(null);
+
+        // Initialize statuses
+        const numChunks = Math.ceil(parsed.length / CHUNK_SIZE);
+        const initialStatuses: { [key: number]: 'idle' | 'translating' | 'completed' | 'failed' } = {};
+        for (let i = 0; i < numChunks; i++) {
+          const chunk = parsed.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          const allTranslated = chunk.every(b => b.translatedText && b.translatedText.trim() !== "");
+          if (allTranslated) {
+            initialStatuses[i] = 'completed';
+          } else {
+            initialStatuses[i] = 'idle';
+          }
+        }
+        setChunkStatuses(initialStatuses);
+        setChunkErrors({});
       }
     };
     reader.readAsText(uploadedFile);
@@ -49,30 +70,227 @@ export default function App() {
     setTimeout(() => setIsKeySaved(false), 2000);
   };
 
+  const scrollToBlock = (blockId: string) => {
+    const element = document.getElementById(`cue-row-${blockId}`);
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      element.classList.add('bg-indigo-50/80', 'ring-2', 'ring-indigo-500');
+      setTimeout(() => {
+        element.classList.remove('bg-indigo-50/80', 'ring-2', 'ring-indigo-500');
+      }, 2000);
+    }
+  };
+
+  const translateChunk = async (chunkIndex: number) => {
+    if (isTranslating || blocks.length === 0) return;
+    
+    setIsTranslating(true);
+    setError(null);
+    setChunkStatuses(prev => ({ ...prev, [chunkIndex]: 'translating' }));
+    setChunkErrors(prev => {
+      const copy = { ...prev };
+      delete copy[chunkIndex];
+      return copy;
+    });
+
+    try {
+      const startIdx = chunkIndex * CHUNK_SIZE;
+      const endIdx = Math.min(startIdx + CHUNK_SIZE, blocks.length);
+      const chunk = blocks.slice(startIdx, endIdx);
+      const textsToTranslate = chunk.map(b => b.text);
+      
+      setTranslatingStatus(`وەرگێڕانا پشکا ${chunkIndex + 1}... (قەبارێ پشکێ: ${chunk.length} دێر)`);
+
+      let translatedTexts: string[] = [];
+      let callSucceeded = false;
+
+      // 1. First, always try Express backend
+      try {
+        const response = await fetch('/api/translate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            texts: textsToTranslate,
+            targetLanguage: language,
+            apiKey: apiKey
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.translatedTexts && Array.isArray(data.translatedTexts)) {
+            translatedTexts = data.translatedTexts;
+            callSucceeded = true;
+          }
+        } else {
+          let serverErrorMsg = "Server error";
+          try {
+            const errData = await response.json();
+            serverErrorMsg = errData?.error || response.statusText;
+          } catch (_) {}
+          console.warn("Backend translation failed:", serverErrorMsg);
+          if (!apiKey || apiKey.trim() === "") {
+            throw new Error(serverErrorMsg);
+          }
+        }
+      } catch (serverErr: any) {
+        console.warn("Server-side call failed:", serverErr);
+        if (!apiKey || apiKey.trim() === "") {
+          throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
+        }
+      }
+
+      // 2. If server-side failed (or 404ed) AND we have an API key, try direct client-side call
+      if (!callSucceeded && apiKey && apiKey.trim() !== "") {
+        try {
+          const prompt = `Translate the following array of subtitle texts into ${language}.
+If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
+You MUST maintain the exact same number of items in the array (exactly ${textsToTranslate.length} items).
+Do not translate the formatting, only the meaning. Keep any HTML-like tags (e.g., <i>, <b>) intact.
+Only return the JSON array of translated strings.
+
+Texts:
+${JSON.stringify(textsToTranslate)}`;
+
+          let fetchSuccess = false;
+          let lastApiErrorMsg = "";
+          const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+
+          for (const modelName of modelsToTry) {
+            try {
+              const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contents: [{
+                    parts: [{ text: prompt }]
+                  }],
+                  generationConfig: {
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                      type: 'ARRAY',
+                      items: {
+                        type: 'STRING'
+                      }
+                    }
+                  }
+                })
+              });
+
+              if (!response.ok) {
+                let apiErrorMsg = response.statusText;
+                try {
+                  const errData = await response.json();
+                  apiErrorMsg = errData?.error?.message || response.statusText;
+                } catch (_) {}
+                lastApiErrorMsg = apiErrorMsg;
+                continue;
+              }
+
+              const data = await response.json();
+              const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+              
+              let parsed: any = [];
+              try {
+                parsed = JSON.parse(rawText.trim());
+              } catch (jsonErr) {
+                const match = rawText.match(/\[[\s\S]*\]/);
+                if (match) {
+                  parsed = JSON.parse(match[0]);
+                } else {
+                  continue;
+                }
+              }
+              
+              if (Array.isArray(parsed)) {
+                translatedTexts = parsed;
+                fetchSuccess = true;
+                callSucceeded = true;
+                break;
+              }
+            } catch (modelErr: any) {
+              lastApiErrorMsg = modelErr.message || "Unknown error";
+              continue;
+            }
+          }
+
+          if (!fetchSuccess) {
+            throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${lastApiErrorMsg}`);
+          }
+        } catch (directErr: any) {
+          throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
+        }
+      }
+
+      if (!callSucceeded) {
+        throw new Error("کردارا وەرگێڕانێ شکەست خوارن.");
+      }
+
+      // Apply translations back
+      const newBlocks = [...blocks];
+      chunk.forEach((block, index) => {
+        const globalIndex = startIdx + index;
+        newBlocks[globalIndex] = {
+          ...newBlocks[globalIndex],
+          translatedText: translatedTexts[index] || newBlocks[globalIndex].text
+        };
+      });
+
+      setBlocks(newBlocks);
+      setChunkStatuses(prev => ({ ...prev, [chunkIndex]: 'completed' }));
+      setTranslatingStatus(`پشکا ${chunkIndex + 1} ب سەرکەفتیانە وەرگێڕا! ✓`);
+      
+      // Calculate overall progress
+      const numChunks = Math.ceil(blocks.length / CHUNK_SIZE);
+      const doneChunks = Object.values({ ...chunkStatuses, [chunkIndex]: 'completed' }).filter(s => s === 'completed').length;
+      setProgress(Math.round((doneChunks / numChunks) * 100));
+
+      setTimeout(() => setTranslatingStatus(null), 3000);
+    } catch (err: any) {
+      console.error(`Error translating chunk ${chunkIndex}:`, err);
+      setChunkStatuses(prev => ({ ...prev, [chunkIndex]: 'failed' }));
+      setChunkErrors(prev => ({ ...prev, [chunkIndex]: err.message || 'Error' }));
+      setError(`خەتا د وەرگێڕانا پشکا ${chunkIndex + 1} دا چێبوو: ${err.message}`);
+    } finally {
+      setIsTranslating(false);
+    }
+  };
+
   const translateSubtitles = async () => {
     if (blocks.length === 0) return;
     setIsTranslating(true);
-    setProgress(0);
     setError(null);
     setTranslatingStatus('دەستپێکرنا کردارا وەرگێڕانێ...');
 
-    try {
-      // Larger chunk size (e.g. 80 lines per chunk) to reduce total requests significantly
-      const CHUNK_SIZE = 80;
-      const chunks = chunkArray<SRTBlock>(blocks, CHUNK_SIZE);
-      const newBlocks = [...blocks];
-      let translatedCount = 0;
+    const numChunks = Math.ceil(blocks.length / CHUNK_SIZE);
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const textsToTranslate = chunk.map((b: SRTBlock) => b.text);
+    try {
+      for (let i = 0; i < numChunks; i++) {
+        // Skip already completed chunks!
+        const chunkBlocks = blocks.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        const isAlreadyDone = chunkStatuses[i] === 'completed' || chunkBlocks.every(b => b.translatedText && b.translatedText.trim() !== "");
+        if (isAlreadyDone) {
+          continue;
+        }
+
+        setChunkStatuses(prev => ({ ...prev, [i]: 'translating' }));
+        setChunkErrors(prev => {
+          const copy = { ...prev };
+          delete copy[i];
+          return copy;
+        });
+
+        const startIdx = i * CHUNK_SIZE;
+        const endIdx = Math.min(startIdx + CHUNK_SIZE, blocks.length);
+        const chunk = blocks.slice(startIdx, endIdx);
+        const textsToTranslate = chunk.map(b => b.text);
         
-        setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${chunks.length}... (قەبارێ وەجبەیێ: ${chunk.length} دێر)`);
+        setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${numChunks}... (قەبارێ پشکێ: ${chunk.length} دێر)`);
 
         let translatedTexts: string[] = [];
         let callSucceeded = false;
 
-        // 1. First, always try Express backend (even if apiKey is provided, because server-side can bypass CORS, referrer restrictions, and fallback to platform key!)
+        // 1. First, always try Express backend
         try {
           const response = await fetch('/api/translate', {
             method: 'POST',
@@ -90,8 +308,6 @@ export default function App() {
               translatedTexts = data.translatedTexts;
               callSucceeded = true;
             }
-          } else if (response.status === 404) {
-            console.warn("Backend server not found (likely running on static host like Netlify).");
           } else {
             let serverErrorMsg = "Server error";
             try {
@@ -99,15 +315,12 @@ export default function App() {
               serverErrorMsg = errData?.error || response.statusText;
             } catch (_) {}
             console.warn("Backend translation failed:", serverErrorMsg);
-            
-            // If we don't have an API key, we cannot try direct client-side, so we must throw the error
             if (!apiKey || apiKey.trim() === "") {
               throw new Error(serverErrorMsg);
             }
           }
         } catch (serverErr: any) {
           console.warn("Server-side call failed:", serverErr);
-          // If we don't have an API key, we cannot try direct client-side, so we must throw the error
           if (!apiKey || apiKey.trim() === "") {
             throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
           }
@@ -156,9 +369,7 @@ ${JSON.stringify(textsToTranslate)}`;
                     const errData = await response.json();
                     apiErrorMsg = errData?.error?.message || response.statusText;
                   } catch (_) {}
-                  
                   lastApiErrorMsg = apiErrorMsg;
-                  console.warn(`Model ${modelName} call failed: ${apiErrorMsg}. Trying next model...`);
                   continue;
                 }
 
@@ -173,7 +384,6 @@ ${JSON.stringify(textsToTranslate)}`;
                   if (match) {
                     parsed = JSON.parse(match[0]);
                   } else {
-                    console.warn(`Could not parse JSON response for model ${modelName}. Trying next...`);
                     continue;
                   }
                 }
@@ -182,43 +392,54 @@ ${JSON.stringify(textsToTranslate)}`;
                   translatedTexts = parsed;
                   fetchSuccess = true;
                   callSucceeded = true;
-                  break; // Found working model!
+                  break;
                 }
               } catch (modelErr: any) {
-                console.warn(`Error using model ${modelName}:`, modelErr);
                 lastApiErrorMsg = modelErr.message || "Unknown error";
                 continue;
               }
             }
 
             if (!fetchSuccess) {
-              throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${lastApiErrorMsg}`);
+              throw new Error(lastApiErrorMsg);
             }
           } catch (directErr: any) {
-            console.error("Direct client-side call failed", directErr);
             throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
           }
         }
 
         if (!callSucceeded) {
-          throw new Error("کردارا وەرگێڕانێ شکەست خوارن. هیڤیە دڵنیابە کو پەیوەندیا ئینتەرنێتێ و کلیلێن API تە د دروستن.");
+          throw new Error("کردارا وەرگێڕانێ شکەست خوارن.");
         }
 
         // Apply translations back
-        chunk.forEach((block, index) => {
-          const globalIndex = i * CHUNK_SIZE + index;
-          newBlocks[globalIndex] = {
-            ...newBlocks[globalIndex],
-            translatedText: translatedTexts[index] || newBlocks[globalIndex].text
-          };
+        setBlocks(currentBlocks => {
+          const newBlocks = [...currentBlocks];
+          chunk.forEach((block, index) => {
+            const globalIndex = startIdx + index;
+            newBlocks[globalIndex] = {
+              ...newBlocks[globalIndex],
+              translatedText: translatedTexts[index] || newBlocks[globalIndex].text
+            };
+          });
+          return newBlocks;
         });
 
-        translatedCount += chunk.length;
-        setProgress(Math.round((translatedCount / blocks.length) * 100));
-        setBlocks([...newBlocks]); // Update UI progressively
+        setChunkStatuses(prev => ({ ...prev, [i]: 'completed' }));
 
-        // If there are more chunks, wait for 4 seconds to respect the Gemini API rate limit (RPM 15)
-        if (i < chunks.length - 1) {
+        // Update global progress
+        const doneChunks = Object.values({ ...chunkStatuses, [i]: 'completed' }).filter(s => s === 'completed').length;
+        setProgress(Math.round((doneChunks / numChunks) * 100));
+
+        // Wait with backoff before continuing to prevent 429 rate limit
+        const hasMoreUncompleted = Array.from({ length: numChunks }, (_, idx) => idx)
+          .slice(i + 1)
+          .some(idx => {
+            const subChunkBlocks = blocks.slice(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+            return chunkStatuses[idx] !== 'completed' && !subChunkBlocks.every(b => b.translatedText && b.translatedText.trim() !== "");
+          });
+
+        if (hasMoreUncompleted && i < numChunks - 1) {
           for (let s = 4; s > 0; s--) {
             setTranslatingStatus(`خێرایی ل بەرچاو هاتیە وەرگرتن: ڕاوەستان بۆ ${s} چرکەیان داکو کێشە دروست نەبیت...`);
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -228,6 +449,13 @@ ${JSON.stringify(textsToTranslate)}`;
       setTranslatingStatus('پرۆسە ب سەرکەفتیانە تەمام بوو! ✓');
       setTimeout(() => setTranslatingStatus(null), 3000);
     } catch (err: any) {
+      console.error("Translation all error:", err);
+      // Mark active translating chunk as failed
+      const activeChunk = Array.from({ length: numChunks }, (_, idx) => idx).find(idx => chunkStatuses[idx] === 'translating');
+      if (activeChunk !== undefined) {
+        setChunkStatuses(prev => ({ ...prev, [activeChunk]: 'failed' }));
+        setChunkErrors(prev => ({ ...prev, [activeChunk]: err.message || 'Error' }));
+      }
       setError(err.message || 'هەلەیەک د وەرگێڕانێ دا چێبوو');
       setTranslatingStatus(null);
     } finally {
@@ -251,6 +479,8 @@ ${JSON.stringify(textsToTranslate)}`;
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+
+  const numChunks = Math.ceil(blocks.length / CHUNK_SIZE);
 
   return (
     <div className="h-screen bg-slate-50 text-slate-900 flex flex-col font-sans overflow-hidden border-8 border-indigo-600" dir="rtl">
@@ -447,7 +677,82 @@ ${JSON.stringify(textsToTranslate)}`;
                 )}
               </section>
 
-              <section className="mt-auto">
+              {blocks.length > 0 && (
+                <section className="border-t border-slate-200 pt-4 flex-1 min-h-0 flex flex-col">
+                  <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 shrink-0">4. پشکێن وەرگێڕانێ ({numChunks})</h2>
+                  <div className="space-y-2 overflow-y-auto pr-1 custom-scrollbar flex-1 min-h-0">
+                    {Array.from({ length: numChunks }).map((_, idx) => {
+                      const startIdx = idx * CHUNK_SIZE;
+                      const endIdx = Math.min(startIdx + CHUNK_SIZE, blocks.length);
+                      const status = chunkStatuses[idx] || 'idle';
+                      const chunkError = chunkErrors[idx];
+
+                      const chunkBlocks = blocks.slice(startIdx, endIdx);
+                      const translatedInChunk = chunkBlocks.filter(b => b.translatedText && b.translatedText.trim() !== "").length;
+                      const chunkPercent = Math.round((translatedInChunk / chunkBlocks.length) * 100);
+
+                      return (
+                        <div 
+                          key={idx} 
+                          onClick={() => {
+                            const firstBlockId = blocks[startIdx]?.id;
+                            if (firstBlockId) scrollToBlock(firstBlockId);
+                          }}
+                          className={`p-2.5 rounded border transition-all cursor-pointer flex flex-col gap-1 text-right ${
+                            status === 'translating' ? 'border-indigo-500 bg-indigo-50/40 shadow-sm ring-1 ring-indigo-500/20' :
+                            status === 'completed' || chunkPercent === 100 ? 'border-green-200 bg-green-50/10 hover:bg-green-50/20' :
+                            status === 'failed' ? 'border-red-200 bg-red-50/30 hover:bg-red-50/40' :
+                            'border-slate-200 bg-white hover:border-indigo-200 hover:bg-indigo-50/5'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1">
+                            <div className="flex flex-col items-start text-right">
+                              <span className="text-xs font-bold text-slate-700">پشکا {idx + 1}</span>
+                              <span className="text-[10px] text-slate-400 font-mono" dir="ltr">{startIdx + 1}-{endIdx}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                              <span className="text-[10px] font-bold text-slate-500">{chunkPercent}%</span>
+                              <button
+                                onClick={() => translateChunk(idx)}
+                                disabled={isTranslating}
+                                className={`p-1 rounded transition-colors ${
+                                  status === 'translating' ? 'text-indigo-600 bg-indigo-100' :
+                                  status === 'completed' || chunkPercent === 100 ? 'text-green-600 bg-green-100 hover:bg-green-200' :
+                                  status === 'failed' ? 'text-red-600 bg-red-100 hover:bg-red-200' :
+                                  'text-slate-500 bg-slate-100 hover:bg-indigo-600 hover:text-white'
+                                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                                title="وەرگێڕانا ڤێ پشکێ تنێ"
+                              >
+                                {status === 'translating' ? (
+                                  <motion.div
+                                    animate={{ rotate: 360 }}
+                                    transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+                                  >
+                                    <Languages className="w-3.5 h-3.5 animate-spin" />
+                                  </motion.div>
+                                ) : status === 'completed' || chunkPercent === 100 ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-green-600" />
+                                ) : status === 'failed' ? (
+                                  <AlertCircle className="w-3.5 h-3.5 text-red-600" />
+                                ) : (
+                                  <Play className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                          {chunkError && (
+                            <span className="text-[9px] text-red-600 font-medium leading-tight truncate block" title={chunkError}>
+                              {chunkError}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              <section className="mt-auto shrink-0">
                 <div className="bg-slate-50 p-4 rounded border border-slate-200">
                   <p className="text-[11px] text-slate-400 uppercase font-bold mb-2">ئامار</p>
                   <div className="flex justify-between text-xs mb-1 text-slate-600">
@@ -477,7 +782,11 @@ ${JSON.stringify(textsToTranslate)}`;
                 {blocks.map((block) => {
                   const isTranslated = !!block.translatedText;
                   return (
-                    <div key={block.id} className="grid grid-cols-12 gap-4 p-4 bg-white rounded-lg border border-slate-200 shadow-sm items-start transition-colors">
+                    <div 
+                      key={block.id} 
+                      id={`cue-row-${block.id}`}
+                      className="grid grid-cols-12 gap-4 p-4 bg-white rounded-lg border border-slate-200 shadow-sm items-start transition-all duration-300"
+                    >
                       <div className="col-span-1 hidden md:block font-mono text-slate-400 text-sm" dir="ltr">
                         {block.id.padStart(3, '0')}
                       </div>
