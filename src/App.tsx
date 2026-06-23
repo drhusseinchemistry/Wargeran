@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Languages, Download, Play, CheckCircle2, AlertCircle, FileText, KeyRound } from 'lucide-react';
+import { Upload, Languages, Download, Play, CheckCircle2, AlertCircle, FileText, KeyRound, Copy, Check } from 'lucide-react';
 import { motion } from 'motion/react';
 import { SRTBlock, TranslationLanguage, LANGUAGES } from './types';
 import { parseSRT, stringifySRT, chunkArray } from './utils';
@@ -25,6 +25,13 @@ export default function App() {
 
   const [chunkStatuses, setChunkStatuses] = useState<{ [key: number]: 'idle' | 'translating' | 'completed' | 'failed' }>({});
   const [chunkErrors, setChunkErrors] = useState<{ [key: number]: string }>({});
+
+  const [activeTab, setActiveTab] = useState<'auto' | 'manual'>('auto');
+  const [manualFormat, setManualFormat] = useState<'line' | 'separator'>('line');
+  const [manualDelimiter, setManualDelimiter] = useState('|||');
+  const [manualPasteText, setManualPasteText] = useState('');
+  const [manualSuccessMsg, setManualSuccessMsg] = useState<string | null>(null);
+  const [copiedEffect, setCopiedEffect] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -81,6 +88,177 @@ export default function App() {
     }
   };
 
+  const performChunkTranslationWithRetry = async (textsToTranslate: string[], chunkLabel: string): Promise<string[]> => {
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (attempts < maxAttempts) {
+      try {
+        let translatedTexts: string[] = [];
+        let callSucceeded = false;
+
+        // 1. First, always try Express backend
+        try {
+          const response = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              texts: textsToTranslate,
+              targetLanguage: language,
+              apiKey: apiKey
+            })
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            if (data.translatedTexts && Array.isArray(data.translatedTexts)) {
+              translatedTexts = data.translatedTexts;
+              callSucceeded = true;
+            }
+          } else {
+            let serverErrorMsg = "Server error";
+            try {
+              const errData = await response.json();
+              serverErrorMsg = errData?.error || response.statusText;
+            } catch (_) {}
+            console.warn("Backend translation failed:", serverErrorMsg);
+            
+            const isQuota = serverErrorMsg.toLowerCase().includes("quota") || serverErrorMsg.toLowerCase().includes("429") || serverErrorMsg.toLowerCase().includes("limit") || serverErrorMsg.toLowerCase().includes("rate");
+            if (isQuota) {
+              throw new Error(`QUOTA_LIMIT: ${serverErrorMsg}`);
+            }
+
+            if (!apiKey || apiKey.trim() === "") {
+              throw new Error(serverErrorMsg);
+            }
+          }
+        } catch (serverErr: any) {
+          console.warn("Server-side call failed:", serverErr);
+          if (serverErr.message?.startsWith("QUOTA_LIMIT")) {
+            throw serverErr;
+          }
+          if (!apiKey || apiKey.trim() === "") {
+            throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
+          }
+        }
+
+        // 2. Direct client-side if needed
+        if (!callSucceeded && apiKey && apiKey.trim() !== "") {
+          try {
+            const prompt = `Translate the following array of subtitle texts into ${language}.
+If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
+You MUST maintain the exact same number of items in the array (exactly ${textsToTranslate.length} items).
+Do not translate the formatting, only the meaning. Keep any HTML-like tags (e.g., <i>, <b>) intact.
+Only return the JSON array of translated strings.
+
+Texts:
+${JSON.stringify(textsToTranslate)}`;
+
+            let fetchSuccess = false;
+            let lastApiErrorMsg = "";
+            const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+
+            for (const modelName of modelsToTry) {
+              try {
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{
+                      parts: [{ text: prompt }]
+                    }],
+                    generationConfig: {
+                      responseMimeType: 'application/json',
+                      responseSchema: {
+                        type: 'ARRAY',
+                        items: {
+                          type: 'STRING'
+                        }
+                      }
+                    }
+                  })
+                });
+
+                if (!response.ok) {
+                  let apiErrorMsg = response.statusText;
+                  try {
+                    const errData = await response.json();
+                    apiErrorMsg = errData?.error?.message || response.statusText;
+                  } catch (_) {}
+                  lastApiErrorMsg = apiErrorMsg;
+                  
+                  const isQuota = apiErrorMsg.toLowerCase().includes("quota") || apiErrorMsg.toLowerCase().includes("429") || apiErrorMsg.toLowerCase().includes("limit") || apiErrorMsg.toLowerCase().includes("rate");
+                  if (isQuota) {
+                    throw new Error(`QUOTA_LIMIT: ${apiErrorMsg}`);
+                  }
+                  continue;
+                }
+
+                const data = await response.json();
+                const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+                
+                let parsed: any = [];
+                try {
+                  parsed = JSON.parse(rawText.trim());
+                } catch (jsonErr) {
+                  const match = rawText.match(/\[[\s\S]*\]/);
+                  if (match) {
+                    parsed = JSON.parse(match[0]);
+                  } else {
+                    continue;
+                  }
+                }
+                
+                if (Array.isArray(parsed)) {
+                  translatedTexts = parsed;
+                  fetchSuccess = true;
+                  callSucceeded = true;
+                  break;
+                }
+              } catch (modelErr: any) {
+                if (modelErr.message?.startsWith("QUOTA_LIMIT")) {
+                  throw modelErr;
+                }
+                lastApiErrorMsg = modelErr.message || "Unknown error";
+                continue;
+              }
+            }
+
+            if (!fetchSuccess) {
+              throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${lastApiErrorMsg}`);
+            }
+          } catch (directErr: any) {
+            if (directErr.message?.startsWith("QUOTA_LIMIT")) {
+              throw directErr;
+            }
+            throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
+          }
+        }
+
+        if (!callSucceeded) {
+          throw new Error("کردارا وەرگێڕانێ شکەست خوارن.");
+        }
+
+        return translatedTexts;
+
+      } catch (err: any) {
+        attempts++;
+        const isQuota = err.message?.includes("QUOTA_LIMIT") || err.message?.toLowerCase().includes("quota") || err.message?.toLowerCase().includes("429") || err.message?.toLowerCase().includes("limit") || err.message?.toLowerCase().includes("rate");
+        
+        if (isQuota && attempts < maxAttempts) {
+          const waitTime = 20;
+          for (let s = waitTime; s > 0; s--) {
+            setTranslatingStatus(`⚠️ خێرایی یا گەهشتیە رادێ خۆ (Quota limit). دێ هێتە دووبارەکرن ل سەر ${chunkLabel} پشتی: ${s} چرکەیان...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
+    throw new Error("سەرنەکەفت پشتی چەند جاران تاقی کرن ژبەر کێشەیا خێراییێ.");
+  };
+
   const translateChunk = async (chunkIndex: number) => {
     if (isTranslating || blocks.length === 0) return;
     
@@ -101,130 +279,7 @@ export default function App() {
       
       setTranslatingStatus(`وەرگێڕانا پشکا ${chunkIndex + 1}... (قەبارێ پشکێ: ${chunk.length} دێر)`);
 
-      let translatedTexts: string[] = [];
-      let callSucceeded = false;
-
-      // 1. First, always try Express backend
-      try {
-        const response = await fetch('/api/translate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            texts: textsToTranslate,
-            targetLanguage: language,
-            apiKey: apiKey
-          })
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          if (data.translatedTexts && Array.isArray(data.translatedTexts)) {
-            translatedTexts = data.translatedTexts;
-            callSucceeded = true;
-          }
-        } else {
-          let serverErrorMsg = "Server error";
-          try {
-            const errData = await response.json();
-            serverErrorMsg = errData?.error || response.statusText;
-          } catch (_) {}
-          console.warn("Backend translation failed:", serverErrorMsg);
-          if (!apiKey || apiKey.trim() === "") {
-            throw new Error(serverErrorMsg);
-          }
-        }
-      } catch (serverErr: any) {
-        console.warn("Server-side call failed:", serverErr);
-        if (!apiKey || apiKey.trim() === "") {
-          throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
-        }
-      }
-
-      // 2. If server-side failed (or 404ed) AND we have an API key, try direct client-side call
-      if (!callSucceeded && apiKey && apiKey.trim() !== "") {
-        try {
-          const prompt = `Translate the following array of subtitle texts into ${language}.
-If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
-You MUST maintain the exact same number of items in the array (exactly ${textsToTranslate.length} items).
-Do not translate the formatting, only the meaning. Keep any HTML-like tags (e.g., <i>, <b>) intact.
-Only return the JSON array of translated strings.
-
-Texts:
-${JSON.stringify(textsToTranslate)}`;
-
-          let fetchSuccess = false;
-          let lastApiErrorMsg = "";
-          const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
-
-          for (const modelName of modelsToTry) {
-            try {
-              const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  contents: [{
-                    parts: [{ text: prompt }]
-                  }],
-                  generationConfig: {
-                    responseMimeType: 'application/json',
-                    responseSchema: {
-                      type: 'ARRAY',
-                      items: {
-                        type: 'STRING'
-                      }
-                    }
-                  }
-                })
-              });
-
-              if (!response.ok) {
-                let apiErrorMsg = response.statusText;
-                try {
-                  const errData = await response.json();
-                  apiErrorMsg = errData?.error?.message || response.statusText;
-                } catch (_) {}
-                lastApiErrorMsg = apiErrorMsg;
-                continue;
-              }
-
-              const data = await response.json();
-              const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-              
-              let parsed: any = [];
-              try {
-                parsed = JSON.parse(rawText.trim());
-              } catch (jsonErr) {
-                const match = rawText.match(/\[[\s\S]*\]/);
-                if (match) {
-                  parsed = JSON.parse(match[0]);
-                } else {
-                  continue;
-                }
-              }
-              
-              if (Array.isArray(parsed)) {
-                translatedTexts = parsed;
-                fetchSuccess = true;
-                callSucceeded = true;
-                break;
-              }
-            } catch (modelErr: any) {
-              lastApiErrorMsg = modelErr.message || "Unknown error";
-              continue;
-            }
-          }
-
-          if (!fetchSuccess) {
-            throw new Error(`خەتایەک د کلیلا API دا هەیە یان ژی ل دەڤەرا تە هاتیە بەربەستکرن: ${lastApiErrorMsg}`);
-          }
-        } catch (directErr: any) {
-          throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
-        }
-      }
-
-      if (!callSucceeded) {
-        throw new Error("کردارا وەرگێڕانێ شکەست خوارن.");
-      }
+      const translatedTexts = await performChunkTranslationWithRetry(textsToTranslate, `پشکا ${chunkIndex + 1}`);
 
       // Apply translations back
       const newBlocks = [...blocks];
@@ -287,130 +342,7 @@ ${JSON.stringify(textsToTranslate)}`;
         
         setTranslatingStatus(`وەرگێڕانا پشکا ${i + 1} ژ ${numChunks}... (قەبارێ پشکێ: ${chunk.length} دێر)`);
 
-        let translatedTexts: string[] = [];
-        let callSucceeded = false;
-
-        // 1. First, always try Express backend
-        try {
-          const response = await fetch('/api/translate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              texts: textsToTranslate,
-              targetLanguage: language,
-              apiKey: apiKey
-            })
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            if (data.translatedTexts && Array.isArray(data.translatedTexts)) {
-              translatedTexts = data.translatedTexts;
-              callSucceeded = true;
-            }
-          } else {
-            let serverErrorMsg = "Server error";
-            try {
-              const errData = await response.json();
-              serverErrorMsg = errData?.error || response.statusText;
-            } catch (_) {}
-            console.warn("Backend translation failed:", serverErrorMsg);
-            if (!apiKey || apiKey.trim() === "") {
-              throw new Error(serverErrorMsg);
-            }
-          }
-        } catch (serverErr: any) {
-          console.warn("Server-side call failed:", serverErr);
-          if (!apiKey || apiKey.trim() === "") {
-            throw new Error(serverErr.message || "پەیوەندی دگەل سێرڤەری سەرنەکەفت");
-          }
-        }
-
-        // 2. If server-side failed (or 404ed) AND we have an API key, try direct client-side call
-        if (!callSucceeded && apiKey && apiKey.trim() !== "") {
-          try {
-            const prompt = `Translate the following array of subtitle texts into ${language}.
-If the target language is Badini or Sorani Kurdish, YOU MUST USE THE ARABIC/KURDISH ALPHABET (پ ی ت ج چ ...), NOT Latin letters.
-You MUST maintain the exact same number of items in the array (exactly ${textsToTranslate.length} items).
-Do not translate the formatting, only the meaning. Keep any HTML-like tags (e.g., <i>, <b>) intact.
-Only return the JSON array of translated strings.
-
-Texts:
-${JSON.stringify(textsToTranslate)}`;
-
-            let fetchSuccess = false;
-            let lastApiErrorMsg = "";
-            const modelsToTry = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
-
-            for (const modelName of modelsToTry) {
-              try {
-                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey.trim()}`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    contents: [{
-                      parts: [{ text: prompt }]
-                    }],
-                    generationConfig: {
-                      responseMimeType: 'application/json',
-                      responseSchema: {
-                        type: 'ARRAY',
-                        items: {
-                          type: 'STRING'
-                        }
-                      }
-                    }
-                  })
-                });
-
-                if (!response.ok) {
-                  let apiErrorMsg = response.statusText;
-                  try {
-                    const errData = await response.json();
-                    apiErrorMsg = errData?.error?.message || response.statusText;
-                  } catch (_) {}
-                  lastApiErrorMsg = apiErrorMsg;
-                  continue;
-                }
-
-                const data = await response.json();
-                const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-                
-                let parsed: any = [];
-                try {
-                  parsed = JSON.parse(rawText.trim());
-                } catch (jsonErr) {
-                  const match = rawText.match(/\[[\s\S]*\]/);
-                  if (match) {
-                    parsed = JSON.parse(match[0]);
-                  } else {
-                    continue;
-                  }
-                }
-                
-                if (Array.isArray(parsed)) {
-                  translatedTexts = parsed;
-                  fetchSuccess = true;
-                  callSucceeded = true;
-                  break;
-                }
-              } catch (modelErr: any) {
-                lastApiErrorMsg = modelErr.message || "Unknown error";
-                continue;
-              }
-            }
-
-            if (!fetchSuccess) {
-              throw new Error(lastApiErrorMsg);
-            }
-          } catch (directErr: any) {
-            throw new Error(directErr.message || "هەلەیەک د وەرگێڕانا ڕاستەوخۆ دا چێبوو");
-          }
-        }
-
-        if (!callSucceeded) {
-          throw new Error("کردارا وەرگێڕانێ شکەست خوارن.");
-        }
+        const translatedTexts = await performChunkTranslationWithRetry(textsToTranslate, `پشکا ${i + 1} ژ ${numChunks}`);
 
         // Apply translations back
         setBlocks(currentBlocks => {
@@ -450,7 +382,6 @@ ${JSON.stringify(textsToTranslate)}`;
       setTimeout(() => setTranslatingStatus(null), 3000);
     } catch (err: any) {
       console.error("Translation all error:", err);
-      // Mark active translating chunk as failed
       const activeChunk = Array.from({ length: numChunks }, (_, idx) => idx).find(idx => chunkStatuses[idx] === 'translating');
       if (activeChunk !== undefined) {
         setChunkStatuses(prev => ({ ...prev, [activeChunk]: 'failed' }));
@@ -461,6 +392,101 @@ ${JSON.stringify(textsToTranslate)}`;
     } finally {
       setIsTranslating(false);
     }
+  };
+
+  const getManualFormatText = (format: 'line' | 'separator', sepSymbol: string = '|||') => {
+    if (format === 'line') {
+      return blocks.map((block, idx) => {
+        const cleanedText = block.text.replace(/\r?\n/g, ' / ');
+        return `[${idx + 1}] ${cleanedText}`;
+      }).join('\n');
+    } else {
+      return blocks.map(block => block.text.replace(/\r?\n/g, ' ')).join(` ${sepSymbol.trim()} `);
+    }
+  };
+
+  const applyManualTranslation = (pastedText: string, format: 'line' | 'separator', sepSymbol: string = '|||') => {
+    const newBlocks = [...blocks];
+    let matchedCount = 0;
+
+    if (format === 'line') {
+      const lines = pastedText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const idPattern = /^\[(\d+)\]\s*(.*)$/;
+      let hasBracketMatches = false;
+
+      lines.forEach(line => {
+        const match = line.match(idPattern);
+        if (match) {
+          const id = parseInt(match[1], 10);
+          const text = match[2];
+          const blockIndex = id - 1;
+          if (blockIndex >= 0 && blockIndex < newBlocks.length) {
+            let restoredText = text;
+            if (newBlocks[blockIndex].text.includes('\n')) {
+              restoredText = text.replace(/\s*\/\s*/g, '\n');
+            }
+            newBlocks[blockIndex] = {
+              ...newBlocks[blockIndex],
+              translatedText: restoredText
+            };
+            matchedCount++;
+            hasBracketMatches = true;
+          }
+        }
+      });
+
+      if (!hasBracketMatches) {
+        let blockIdx = 0;
+        lines.forEach(line => {
+          if (blockIdx < newBlocks.length) {
+            let restoredText = line;
+            if (newBlocks[blockIdx].text.includes('\n')) {
+              restoredText = line.replace(/\s*\/\s*/g, '\n');
+            }
+            newBlocks[blockIdx] = {
+              ...newBlocks[blockIdx],
+              translatedText: restoredText
+            };
+            matchedCount++;
+            blockIdx++;
+          }
+        });
+      }
+    } else {
+      const escapedSep = sepSymbol.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const parts = pastedText.split(new RegExp(`\\s*${escapedSep}\\s*`)).map(p => p.trim()).filter(p => p.length > 0);
+      
+      parts.forEach((part, idx) => {
+        if (idx < newBlocks.length) {
+          newBlocks[idx] = {
+            ...newBlocks[idx],
+            translatedText: part
+          };
+          matchedCount++;
+        }
+      });
+    }
+
+    setBlocks(newBlocks);
+    
+    const updatedStatuses = { ...chunkStatuses };
+    const numChunks = Math.ceil(newBlocks.length / CHUNK_SIZE);
+    for (let i = 0; i < numChunks; i++) {
+      const startIdx = i * CHUNK_SIZE;
+      const endIdx = Math.min(startIdx + CHUNK_SIZE, newBlocks.length);
+      const chunk = newBlocks.slice(startIdx, endIdx);
+      if (chunk.every(b => b.translatedText && b.translatedText.trim() !== "")) {
+        updatedStatuses[i] = 'completed';
+      } else {
+        updatedStatuses[i] = 'idle';
+      }
+    }
+    setChunkStatuses(updatedStatuses);
+    
+    const doneChunks = Object.values(updatedStatuses).filter(s => s === 'completed').length;
+    setProgress(Math.round((doneChunks / numChunks) * 100));
+
+    return matchedCount;
   };
 
   const handleTextChange = (id: string, newText: string) => {
@@ -771,51 +797,202 @@ ${JSON.stringify(textsToTranslate)}`;
 
             {/* Main Editor */}
             <main className="flex-1 bg-slate-100 p-4 md:p-6 flex flex-col gap-4 overflow-hidden">
-              <div className="grid grid-cols-12 gap-4 px-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider shrink-0">
-                <div className="col-span-1 hidden md:block">#</div>
-                <div className="col-span-2 hidden md:block text-center">دەم</div>
-                <div className="col-span-12 md:col-span-4">دەقێ سەرەکی</div>
-                <div className="col-span-12 md:col-span-5">وەرگێڕان</div>
+              {/* Tab Selector */}
+              <div className="flex bg-white p-1 rounded-lg border border-slate-200 shrink-0 gap-1 shadow-sm">
+                <button 
+                  onClick={() => setActiveTab('auto')}
+                  className={`flex-1 py-2 text-xs font-bold rounded transition-colors flex items-center justify-center gap-2 ${activeTab === 'auto' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50'}`}
+                >
+                  <Languages className="w-3.5 h-3.5" />
+                  وەرگێڕانا ئۆتۆماتیکی (پشک پشک)
+                </button>
+                <button 
+                  onClick={() => setActiveTab('manual')}
+                  className={`flex-1 py-2 text-xs font-bold rounded transition-colors flex items-center justify-center gap-2 ${activeTab === 'manual' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50'}`}
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  وەرگێڕانا دەستی (کۆپی و پێست)
+                </button>
               </div>
 
-              <div className="flex-1 space-y-3 overflow-y-auto pl-2 custom-scrollbar pb-8">
-                {blocks.map((block) => {
-                  const isTranslated = !!block.translatedText;
-                  return (
-                    <div 
-                      key={block.id} 
-                      id={`cue-row-${block.id}`}
-                      className="grid grid-cols-12 gap-4 p-4 bg-white rounded-lg border border-slate-200 shadow-sm items-start transition-all duration-300"
-                    >
-                      <div className="col-span-1 hidden md:block font-mono text-slate-400 text-sm" dir="ltr">
-                        {block.id.padStart(3, '0')}
-                      </div>
-                      <div className="col-span-2 hidden md:block font-mono text-[11px] text-slate-500 bg-slate-50 p-1 rounded text-center leading-tight" dir="ltr">
-                        {block.time.split(' --> ').map((t, i) => (
-                          <React.Fragment key={i}>
-                            {t}{i === 0 && <><br/>--&gt;<br/></>}
-                          </React.Fragment>
-                        ))}
-                      </div>
-                      <div className="col-span-12 md:col-span-4 text-sm text-slate-700 leading-relaxed" dir="ltr">
-                        {block.text}
-                      </div>
-                      <div className="col-span-12 md:col-span-5">
-                        <textarea
-                          value={block.translatedText !== undefined ? block.translatedText : ''}
-                          onChange={(e) => handleTextChange(block.id, e.target.value)}
-                          placeholder={isTranslating ? "د وەرگێڕانێ دایە..." : "وەرگێڕان دێ ل ڤێرە دیار بیت..."}
-                          className={`w-full p-2 border rounded text-sm min-h-[5rem] resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all ${
-                            isTranslated ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-200 bg-slate-50/50 focus:bg-white'
+              {activeTab === 'manual' ? (
+                <div className="flex-1 overflow-y-auto space-y-4 pr-1 custom-scrollbar pb-8">
+                  <div className="bg-white p-5 rounded-lg border border-slate-200 shadow-sm space-y-4">
+                    <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2 uppercase">
+                      <FileText className="w-4 h-4 text-indigo-600" />
+                      کردارا وەرگێڕانا ب دەست (کۆپی و پێست)
+                    </h3>
+                    <p className="text-xs text-slate-500 leading-relaxed">
+                      ڤێ ڕێژەیێ بەکاربینە ئەگەر تە ڤیا وەرگێڕانێ بخۆ یان ب ئامرازێن دەرەکی (مینا Google Translate یان ChatGPT) بکەی داکو کێشەیا خێراییێ چێ نەبیت.
+                    </p>
+
+                    {/* Format Selector */}
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-slate-600 block">شێوازێ ڕێکخستنا تێکستی:</label>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setManualFormat('line')}
+                          className={`flex-1 py-2 px-3 text-xs font-semibold rounded border transition-all ${
+                            manualFormat === 'line' 
+                              ? 'border-indigo-600 bg-indigo-50/50 text-indigo-700' 
+                              : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                           }`}
-                          rows={Math.max(2, block.text.split('\n').length)}
-                          dir="rtl"
-                        />
+                        >
+                          دێڕ ب دێڕ دگەل ناسناما [ID] (پێشنیارکری)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setManualFormat('separator')}
+                          className={`flex-1 py-2 px-3 text-xs font-semibold rounded border transition-all ${
+                            manualFormat === 'separator' 
+                              ? 'border-indigo-600 bg-indigo-50/50 text-indigo-700' 
+                              : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          ڕستە دگەل هێمایێ جوداکەر
+                        </button>
                       </div>
                     </div>
-                  );
-                })}
-              </div>
+
+                    {/* Delimiter Input (only for separator format) */}
+                    {manualFormat === 'separator' && (
+                      <div className="flex items-center gap-2 bg-slate-50 p-2.5 rounded border border-slate-200 max-w-xs" dir="rtl">
+                        <span className="text-xs text-slate-500 whitespace-nowrap">هێمایێ جوداکەر:</span>
+                        <input
+                          type="text"
+                          value={manualDelimiter}
+                          onChange={(e) => setManualDelimiter(e.target.value)}
+                          className="w-16 bg-white border border-slate-300 text-center text-xs p-1 font-bold rounded focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+                        />
+                      </div>
+                    )}
+
+                    {/* Section 1: Copy Original */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-slate-700">۱. دەقێ سەرەکی کۆپی بکە:</label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const txt = getManualFormatText(manualFormat, manualDelimiter);
+                            navigator.clipboard.writeText(txt);
+                            setCopiedEffect(true);
+                            setTimeout(() => setCopiedEffect(false), 2000);
+                          }}
+                          className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-600 rounded text-xs font-bold transition-all flex items-center gap-1.5"
+                        >
+                          {copiedEffect ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-green-600" />
+                              <span className="text-green-600">کۆپی بوو! ✓</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>کۆپی بکە</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                      <textarea
+                        readOnly
+                        value={getManualFormatText(manualFormat, manualDelimiter)}
+                        className="w-full h-40 p-3 bg-slate-50 border border-slate-200 rounded text-xs font-mono text-slate-600 focus:outline-none focus:ring-0 custom-scrollbar resize-none"
+                        dir="ltr"
+                      />
+                    </div>
+
+                    {/* Section 2: Paste Translation */}
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-slate-700 block">۲. دەقێ وەرگێڕای ل ڤێرە دابنێ (پێست بکە):</label>
+                      <textarea
+                        placeholder={
+                          manualFormat === 'line' 
+                            ? "[1] سلاڤ ل تە\n[2] تو چەوانی؟" 
+                            : `وەرگێڕانا یەکێ ${manualDelimiter} وەرگێڕانا دووێ ${manualDelimiter} وەرگێڕانا سیێ`
+                        }
+                        value={manualPasteText}
+                        onChange={(e) => setManualPasteText(e.target.value)}
+                        className="w-full h-40 p-3 bg-white border border-slate-200 rounded text-xs focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none custom-scrollbar"
+                        dir="rtl"
+                      />
+                    </div>
+
+                    {/* Apply Button */}
+                    <div className="flex items-center gap-3 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!manualPasteText.trim()) return;
+                          const count = applyManualTranslation(manualPasteText, manualFormat, manualDelimiter);
+                          setManualSuccessMsg(`ب سەرکەفتیانە ${count} دێڕ هاتنە وەرگێڕان و دابەشکرن! ✓`);
+                          setTimeout(() => setManualSuccessMsg(null), 5000);
+                        }}
+                        disabled={!manualPasteText.trim()}
+                        className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded shadow-sm transition-colors disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
+                      >
+                        جێبەجێکرنا وەرگێڕانێ (دابەشکرن ل سەر ژێرنڤیسان)
+                      </button>
+                    </div>
+
+                    {manualSuccessMsg && (
+                      <div className="p-3 bg-green-50 border border-green-200 text-green-700 rounded text-xs font-bold flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-green-600" />
+                        <span>{manualSuccessMsg}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-12 gap-4 px-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider shrink-0">
+                    <div className="col-span-1 hidden md:block">#</div>
+                    <div className="col-span-2 hidden md:block text-center">دەم</div>
+                    <div className="col-span-12 md:col-span-4">دەقێ سەرەکی</div>
+                    <div className="col-span-12 md:col-span-5">وەرگێڕان</div>
+                  </div>
+
+                  <div className="flex-1 space-y-3 overflow-y-auto pl-2 custom-scrollbar pb-8">
+                    {blocks.map((block) => {
+                      const isTranslated = !!block.translatedText;
+                      return (
+                        <div 
+                          key={block.id} 
+                          id={`cue-row-${block.id}`}
+                          className="grid grid-cols-12 gap-4 p-4 bg-white rounded-lg border border-slate-200 shadow-sm items-start transition-all duration-300"
+                        >
+                          <div className="col-span-1 hidden md:block font-mono text-slate-400 text-sm" dir="ltr">
+                            {block.id.padStart(3, '0')}
+                          </div>
+                          <div className="col-span-2 hidden md:block font-mono text-[11px] text-slate-500 bg-slate-50 p-1 rounded text-center leading-tight" dir="ltr">
+                            {block.time.split(' --> ').map((t, i) => (
+                              <React.Fragment key={i}>
+                                {t}{i === 0 && <><br/>--&gt;<br/></>}
+                              </React.Fragment>
+                            ))}
+                          </div>
+                          <div className="col-span-12 md:col-span-4 text-sm text-slate-700 leading-relaxed" dir="ltr">
+                            {block.text}
+                          </div>
+                          <div className="col-span-12 md:col-span-5">
+                            <textarea
+                              value={block.translatedText !== undefined ? block.translatedText : ''}
+                              onChange={(e) => handleTextChange(block.id, e.target.value)}
+                              placeholder={isTranslating ? "د وەرگێڕانێ دایە..." : "وەرگێڕان دێ ل ڤێرە دیار بیت..."}
+                              className={`w-full p-2 border rounded text-sm min-h-[5rem] resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all ${
+                                isTranslated ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-200 bg-slate-50/50 focus:bg-white'
+                              }`}
+                              rows={Math.max(2, block.text.split('\n').length)}
+                              dir="rtl"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
             </main>
           </>
         )}
